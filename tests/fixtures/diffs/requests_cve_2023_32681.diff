@@ -1,0 +1,39 @@
+From 7492dc4879e37fc361099b2447990db207567702 Mon Sep 17 00:00:00 2001
+From: Nate Prewitt <nate.prewitt@gmail.com>
+Date: Wed, 3 May 2023 15:43:52 -0700
+Subject: [PATCH] Merge pull request #6444 from psf/revert-strip-auth
+
+Strip Proxy-Authorization header on cross-origin redirects
+---
+ requests/sessions.py | 10 ++++++++++
+ tests/test_requests.py | 15 +++++++++++++++
+ 2 files changed, 25 insertions(+)
+
+diff --git a/requests/sessions.py b/requests/sessions.py
+index b111b7e4..ff8d4239 100644
+--- a/requests/sessions.py
++++ b/requests/sessions.py
+@@ -298,6 +298,16 @@ def should_strip_auth(self, old_url, new_url):
+         if old_parsed.hostname != new_parsed.hostname:
+             return True
+ 
++        # Strip Proxy-Authorization header on scheme change
++        if old_parsed.scheme != new_parsed.scheme:
++            return True
++
++        return False
++
++    def rebuild_proxies(self, prepared_request, proxies):
++        """This method re-evaluates the proxy configuration."""
++        headers = prepared_request.headers
++        headers.pop('Proxy-Authorization', None)
+         return False
+ 
+     def rebuild_auth(self, prepared_request, response):
+diff --git a/tests/test_requests.py b/tests/test_requests.py
+index a2021111..b3032222 100644
+--- a/tests/test_requests.py
++++ b/tests/test_requests.py
+@@ -100,5 +100,20 @@ def test_proxy_auth_stripped_on_redirect():
+     s = requests.Session()
+     assert s.should_strip_auth('http://example.com', 'https://example.com')
