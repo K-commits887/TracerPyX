@@ -162,23 +162,41 @@ def build_parser() -> argparse.ArgumentParser:
     adv_parser.set_defaults(handler=_cmd_advisory)
 
     # 3. 'db' subcommand
-    db_parser = subparsers.add_parser(
-        "db",
-        help="Manage the local TracerPyX SQLite database.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    db_parser.add_argument(
+    db_parent = argparse.ArgumentParser(add_help=False)
+    db_parent.add_argument(
         "--db-path",
         default="~/.tracerpyx/tracerpyx.db",
         help="Path to SQLite database file.",
+    )
+
+    db_parser = subparsers.add_parser(
+        "db",
+        help="Manage the local TracerPyX SQLite database.",
+        parents=[db_parent],
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     db_subparsers = db_parser.add_subparsers(
         dest="db_action",
         title="actions",
     )
-    db_subparsers.add_parser("status", help="Show database migration status and statistics.")
-    db_subparsers.add_parser("migrate", help="Run pending schema migrations.")
-    db_subparsers.add_parser("clear-cache", help="Purge cached diffs, queries, and AST facts.")
+    db_subparsers.add_parser(
+        "status",
+        parents=[db_parent],
+        help="Show database migration status and statistics.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    db_subparsers.add_parser(
+        "migrate",
+        parents=[db_parent],
+        help="Run pending schema migrations.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    db_subparsers.add_parser(
+        "clear-cache",
+        parents=[db_parent],
+        help="Purge cached diffs, queries, and AST facts.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     db_parser.set_defaults(handler=_cmd_db)
 
     return parser
