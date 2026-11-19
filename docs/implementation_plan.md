@@ -42,17 +42,23 @@ TracerPyX is decomposed into two distinct, loosely coupled pipelines that commun
   │ 4. AST Patch Analyzer │  Parses unified diffs + Python ASTs of modified files.
   └──────────┬────────────┘  Identifies enclosing functions, methods, classes, and scopes.
              │
-             ▼
-  ┌───────────────────────┐
-  │ 5. Symbol Extractor   │  Generates candidate symbols (deleted/modified lines vs added).
-  └──────────┬────────────┘  Optional LLM-assisted candidate suggestion.
-             │
-             ▼
-  ┌───────────────────────┐
-  │ 6. Symbol Validator   │  Deterministically validates candidates against AST structure
-  └──────────┬────────────┘  and assigns status: CONFIRMED, CANDIDATE, PACKAGE_ONLY,
-             │               UNKNOWN, or REJECTED.
-             ▼
+             ├─────────────────────────────────────────┐
+             │                                         │ (Diff + Advisory context)
+             ▼                                         ▼
+  ┌───────────────────────┐                 ┌─────────────────────────────────┐
+  │ 5. Symbol Extractor   │                 │ [OPTIONAL] LLM Provider         │
+  │ (AST diff heuristics) │                 │ - Analyzes patch & advisory     │
+  └──────────┬────────────┘                 │ - Proposes candidate symbols    │
+             │                              └──────────────┬──────────────────┘
+             │                                             │ (Candidate suggestions)
+             └──────────────────────┬──────────────────────┘
+                                    │
+                                    ▼
+                     ┌─────────────────────────────┐
+                     │ 6. Deterministic Validator  │  Checks candidate existence in
+                     └──────────────┬──────────────┘  pre-patch AST; rejects test/docs;
+                                    │                 assigns CONFIRMED, CANDIDATE,
+                                    ▼                 PACKAGE_ONLY, UNKNOWN, REJECTED.
   ┌──────────────────────────────────────────────────────────────────────────────────┐
   │                      PERSISTENT SQLITE DATABASE & REPOSITORY                     │
   │   Advisory  │  AffectedPackage  │  VulnerableSymbol  │  SymbolEvidence  │ Cache   │
@@ -90,10 +96,12 @@ TracerPyX is decomposed into two distinct, loosely coupled pipelines that commun
   └──────────┬────────────┘ (resolution kind, location, confidence).
              │
              ▼
-  ┌───────────────────────┐
-  │ 6. Dynamic Resolver   │ Handles unresolved call sites: constant propagation,
-  └──────────┬────────────┘ optional LLM target suggestion, deterministic verification.
-             │
+  ┌───────────────────────┐                 ┌─────────────────────────────────┐
+  │ 6. Dynamic Resolver   │◄───────────────►│ [OPTIONAL] LLM Provider         │
+  │ - Constant propagation│ (Unresolved     │ - Proposes candidate targets    │
+  │ - Symbol table check  │  call context)  │   for dynamic calls (getattr)   │
+  └──────────┬────────────┘                 └─────────────────────────────────┘
+             │ (Resolved / Unresolved edges tagged with confidence)
              ▼
   ┌───────────────────────┐
   │ 7. Entry Point Engine │ Detects main entry points, CLI scripts, and framework routes
@@ -387,11 +395,106 @@ CREATE TABLE IF NOT EXISTS analysis_cache (
 
 ---
 
-## 6. Rules for Evidence and Validation
+## 6. LLM Integration Architecture and Guardrails
+
+While TracerPyX's primary analysis pipeline is strictly deterministic, large language models (LLMs) can be integrated as **optional heuristic advisors** at two specific friction points in static analysis:
+1. **Advisory Commit Analysis**: When a fix commit touches multiple files and AST diffing produces several candidate functions.
+2. **Unresolved Dynamic Call Sites**: When deterministic constant propagation cannot resolve the receiver of a dynamic call (`getattr`, dictionary dispatch, callback handlers).
+
+### 6.1. Architectural Placement and Flow
+
+```
+                      ┌────────────────────────────────────────┐
+                      │    Optional LLM Provider Interface     │
+                      │  (OpenAI, Anthropic, Gemini, Ollama)   │
+                      └──────────────────┬─────────────────────┘
+                                         │
+                 ┌───────────────────────┴───────────────────────┐
+                 │                                               │
+                 ▼                                               ▼
+   [Use Case 1: Symbol Suggestion]                [Use Case 2: Dynamic Call Disambiguation]
+   - Inputs: Advisory Text, Commit Msg, Diff      - Inputs: Enclosing Scope AST, Call Site
+   - Prompt: Identify vulnerable function         - Prompt: Identify plausible target FQN
+                 │                                               │
+                 ▼                                               ▼
+         LLM Output: CANDIDATE                           LLM Output: CANDIDATE TARGET
+                 │                                               │
+                 ▼                                               ▼
+   ┌───────────────────────────┐                  ┌───────────────────────────┐
+   │ Deterministic Gate 1:     │                  │ Deterministic Gate 2:     │
+   │ Pre-patch AST Validator   │                  │ Symbol Table Validator    │
+   │ - Does symbol exist in    │                  │ - Does target symbol      │
+   │   vulnerable release AST? │                  │   exist in loaded ASTs?   │
+   │ - Is it in test / docs?   │                  │ - Is package imported?    │
+   └─────────────┬─────────────┘                  └─────────────┬─────────────┘
+                 │                                               │
+       ┌─────────┴─────────┐                           ┌─────────┴─────────┐
+       ▼                   ▼                           ▼                   ▼
+    [PASSED]            [FAILED]                    [PASSED]            [FAILED]
+   Keep as CANDIDATE    REJECTED                  Add Edge as         Discard suggestion;
+   (Never CONFIRMED     (Zero trace               DYNAMIC_ESTIMATED   Keep as UNRESOLVED;
+   without diff proof)   in DB)                   Confidence: LOW     Classification: UNCERTAIN
+```
+
+### 6.2. Provider-Independent Interface (`tracerpyx.intelligence.llm.base`)
+
+```python
+from abc import ABC, abstractmethod
+from typing import Optional
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class LLMSymbolSuggestion:
+    symbol_name: str          # e.g., "urllib3.util.url.parse_url"
+    rationale: str            # Explanation from the LLM
+    confidence_score: float   # Self-reported 0.0 - 1.0
+
+@dataclass(frozen=True)
+class LLMCallTargetSuggestion:
+    target_fqn: str           # e.g., "myapp.services.payment.process_card"
+    rationale: str
+
+class LLMProvider(ABC):
+    """Abstract interface decoupling TracerPyX from specific model providers."""
+
+    @abstractmethod
+    def suggest_vulnerable_symbols(
+        self,
+        package_name: str,
+        advisory_summary: str,
+        commit_message: str,
+        diff_text: str,
+    ) -> list[LLMSymbolSuggestion]:
+        """Suggest candidate vulnerable symbols from a fix commit diff."""
+        ...
+
+    @abstractmethod
+    def suggest_call_targets(
+        self,
+        enclosing_function: str,
+        call_site_code: str,
+        available_imports: list[str],
+        known_symbols: list[str],
+    ) -> list[LLMCallTargetSuggestion]:
+        """Suggest potential target functions for an unresolved dynamic call site."""
+        ...
+```
+
+### 6.3. Strict Epistemological Rules for LLM Output
+
+1. **Never Confirmed via LLM**: An LLM suggestion can **never** assign the status `CONFIRMED`. It may only promote an advisory from `UNKNOWN` to `CANDIDATE`.
+2. **Pre-Patch AST Existence Check**: Any symbol suggested by an LLM must be verified by `symbol_validator.py` against the pre-patch AST of the affected package. If the symbol does not exist in the code (a hallucination), it is immediately marked `REJECTED`.
+3. **No Dynamic Edge Hallucinations**: In the call graph, an edge suggested by an LLM is assigned `ResolutionKind.DYNAMIC_RESOLVED` with `ConfidenceLevel.LOW`. If that edge is the only link connecting an application to a vulnerable symbol, the reachability engine classifies the finding as **`UNCERTAIN`** (never `REACHABLE`), citing the unverified dynamic edge in the report.
+4. **Offline by Default**: If no API key or provider is configured, the entire LLM subsystem is inactive. All core functionality (discovery, AST parsing, symbol resolution, graph traversal, and reporting) functions completely offline.
+5. **Deterministic Testing**: All unit and integration tests use `MockLLMProvider`, returning predetermined fixture responses without network calls.
+
+---
+
+## 7. Rules for Evidence and Validation
 
 TracerPyX establishes strict epistemological rules to prevent false certainties:
 
-### 6.1. Symbol Status Criteria
+### 7.1. Symbol Status Criteria
 1. **`CONFIRMED`**:
    - The symbol was identified directly in an advisory security bulletin, OR
    - The symbol is mapped to deleted or modified logic in a verified fix commit **AND** has been validated against the pre-patch AST of the affected package version.
@@ -405,7 +508,7 @@ TracerPyX establishes strict epistemological rules to prevent false certainties:
 5. **`REJECTED`**:
    - The symbol was suggested (e.g. by an LLM or keyword match) but was determined to be a newly added function (the fix itself), a test fixture, or does not exist in the vulnerable codebase.
 
-### 6.2. Reachability Classification Invariants
+### 7.2. Reachability Classification Invariants
 - An advisory with `PACKAGE_ONLY` or `UNKNOWN` symbols whose package is imported or called by the application must **always** yield **`UNCERTAIN`**, never `UNREACHABLE`.
 - If an application calls a library through an unresolved dynamic dispatch (e.g., `getattr()`, `dispatcher[event]()`), and that module imports the affected package, the reachability engine must downgrade a potential `UNREACHABLE` to **`UNCERTAIN`**.
 - An advisory may only be declared **`UNREACHABLE`** when:
@@ -415,7 +518,7 @@ TracerPyX establishes strict epistemological rules to prevent false certainties:
 
 ---
 
-## 7. Stage-by-Stage Implementation Plan
+## 8. Stage-by-Stage Implementation Plan
 
 We organize implementation into **14 discrete stages**. Each stage is self-contained, fully testable with unit tests, and accompanied by explicit acceptance criteria.
 
@@ -597,7 +700,7 @@ Stage 14: Reporters, End-to-End Integration & Real-World CVE Benchmark
 
 ---
 
-## 8. Technical Risks and Mitigations
+## 9. Technical Risks and Mitigations
 
 | Risk | Impact | Architectural Mitigation |
 |------|--------|--------------------------|
@@ -609,7 +712,7 @@ Stage 14: Reporters, End-to-End Integration & Real-World CVE Benchmark
 
 ---
 
-## 9. Next Steps
+## 10. Next Steps
 
 Upon your approval of this plan, we will proceed to **Stage 1**:
 - Set up `pyproject.toml`, directory structure, base CLI, and centralized logging.
