@@ -77,18 +77,20 @@ def test_advisory_sync(capsys: pytest.CaptureFixture[str]) -> None:
     assert "Advisory sync placeholder for: flask" in captured.out
 
 
-def test_db_subcommands(capsys: pytest.CaptureFixture[str]) -> None:
+def test_db_subcommands(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     """Ensure db status, migrate, and clear-cache subcommands execute."""
+    db_file = str(tmp_path / "test.db")
     for action in ["status", "migrate", "clear-cache"]:
-        ret = main(["db", action, "--db-path", "test.db"])
+        ret = main(["db", action, "--db-path", db_file])
         assert ret == 0
     captured = capsys.readouterr()
     assert "TracerPyX Database" in captured.out
-    assert "Running migrations" in captured.out
-    assert "Clearing cache" in captured.out
+    assert "Successfully applied migration" in captured.out
+    assert "Cleared 0 item(s)" in captured.out
 
 
-def test_logging_flags_configuration() -> None:
+def test_logging_flags_configuration(tmp_path: Path) -> None:
     """Ensure verbose and quiet flags adjust logging without crashing."""
-    assert main(["-v", "db", "status"]) == 0
-    assert main(["-q", "db", "status"]) == 0
+    db_file = str(tmp_path / "logging_test.db")
+    assert main(["-v", "db", "status", "--db-path", db_file]) == 0
+    assert main(["-q", "db", "status", "--db-path", db_file]) == 0

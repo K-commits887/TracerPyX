@@ -50,18 +50,43 @@ def _cmd_advisory(args: argparse.Namespace) -> int:
 
 def _cmd_db(args: argparse.Namespace) -> int:
     """Handler for the 'db' subcommand."""
+    from tracerpyx.db import (
+        AdvisoryRepository,
+        CacheRepository,
+        DatabaseManager,
+        get_applied_versions,
+        run_migrations,
+    )
+
     action = getattr(args, "db_action", None)
     db_path = Path(args.db_path).expanduser().resolve()
     logger.info("Database command '%s' targeting: %s", action, db_path)
 
+    db = DatabaseManager(db_path)
+
     if action == "status":
+        with db.get_connection() as conn:
+            applied = get_applied_versions(conn)
+        adv_repo = AdvisoryRepository(db)
+        cache_repo = CacheRepository(db)
         print(f"TracerPyX Database: {db_path} (exists={db_path.exists()})")
+        print(f"Applied Migrations: {sorted(applied) if applied else 'None'}")
+        print(f"Total Advisories:   {adv_repo.count_advisories() if applied else 0}")
+        print(f"Cached Items:       {cache_repo.count() if applied else 0}")
         return 0
     elif action == "migrate":
-        print(f"Running migrations on: {db_path}")
+        applied = run_migrations(db)
+        if applied:
+            print(f"Successfully applied migration(s): {applied} on {db_path}")
+        else:
+            print(f"Database {db_path} is already up to date.")
         return 0
     elif action == "clear-cache":
-        print(f"Clearing cache on: {db_path}")
+        # Ensure migrations are applied first so table exists
+        run_migrations(db)
+        cache_repo = CacheRepository(db)
+        deleted = cache_repo.clear()
+        print(f"Cleared {deleted} item(s) from analysis cache on {db_path}.")
         return 0
     else:
         logger.error("No valid db action specified. Use --help.")
