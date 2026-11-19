@@ -1,0 +1,1085 @@
+# **TracerPyX: Overall System Architecture**
+
+TracerPyX is a Python static-analysis tool that determines whether known vulnerabilities in third-party dependencies are actually reachable from a project's code.
+
+The central idea is to connect three types of information:
+
+1. **Vulnerability information:** Which package and function contain a vulnerability?
+2. **Program structure:** Which functions call which other functions?
+3. **Reachability:** Can execution travel from the application's entry points to the vulnerable function?
+
+The tool then generates a report explaining its conclusion, including the call path used as evidence.
+
+I'll explain the architecture from the perspective of how data moves through the system, why each module exists, and how the modules communicate.
+
+# **1. High-level architecture**
+
+First, imagine a developer runs:
+
+```
+tracerpyx scan ./my-project
+```
+
+The project contains:
+
+```
+my-project/
+│
+├── main.py
+├── routes.py
+├── payment.py
+├── requirements.txt
+└── ...
+```
+
+Suppose `requirements.txt` contains:
+
+```
+example-library==1.2.0
+requests==2.25.0
+flask==2.0.1
+```
+
+A conventional dependency scanner might report that `example-library` has a known vulnerability.
+
+TracerPyX goes further and asks:
+
+- Which function is vulnerable?
+- Where is that function defined?
+- Does our project call it?
+- Is there a chain of function calls connecting our application to it?
+
+The complete architecture looks like this:
+
+**1. Input Layer**
+
+Project directory · Lockfiles · Dependency information
+
+**2. Source Analysis**
+
+parser/
+
+symbol_resolver/
+
+graph/
+
+**3. Vulnerability Analysis**
+
+scanning_matcher/
+
+metadata_cache/
+
+**4. Core Analysis Engine — engine/**
+
+Combines vulnerability information and call graph to perform reachability analysis
+
+**5. Classification**
+
+Reachable
+
+Not reachable
+
+Uncertain
+
+**6. Output Layer — reporter/**
+
+Terminal · JSON · OpenVEX
+
+Notice that source analysis and vulnerability analysis are separate branches. This is intentional.
+
+The source-analysis branch discovers the structure of the application, while the vulnerability-analysis branch discovers the vulnerable functions. The engine combines their results.
+
+# **2. Input layer: Understanding the target project**
+
+Before analysis begins, TracerPyX needs to understand what it is scanning.
+
+The input layer receives:
+
+- Project directory.
+- Dependency files.
+- Python source files.
+- Optional entry-point configuration.
+- Existing vulnerability alerts, if provided.
+
+### **A. Project discovery**
+
+The tool first identifies the project structure.
+
+For example:
+
+```
+my-project/
+│
+├── app/
+│   ├── __init__.py
+│   ├── main.py
+│   ├── routes.py
+│   └── services.py
+│
+├── tests/
+├── requirements.txt
+└── pyproject.toml
+```
+
+It should identify:
+
+- Python source directories.
+- Dependency manifests and lockfiles.
+- Virtual environments to exclude.
+- Test directories.
+- Project configuration.
+- Potential application entry points.
+
+### **B. Dependency discovery**
+
+The next task is determining which packages and versions are actually installed or resolved.
+
+For example:
+
+```
+example-library==1.2.0
+requests==2.25.0
+flask==2.0.1
+```
+
+The tool must also understand transitive dependencies.
+
+Consider:
+
+```
+my-project
+    |
+    |---- flask
+    |       |
+    |       |---- werkzeug
+    |
+    |---- requests
+            |
+            |---- urllib3
+```
+
+Even if your application doesn't explicitly install `urllib3`, it might be installed through `requests`.
+
+This is important because vulnerabilities can exist in indirect dependencies.
+
+**Output of this layer:**
+
+A normalized project representation containing the source directories, dependency graph, package versions and configured entry points.
+
+# **3.&#x20;**`parser/`**: Python source parsing and AST extraction**
+
+Foundation of the analysis
+
+This module understands what is written in the Python source code.
+
+It uses Python's Abstract Syntax Tree (AST).
+
+An AST represents source code as a structured tree rather than simply treating it as text.
+
+Consider:
+
+```
+def checkout():    process_payment()
+```
+
+Its conceptual AST looks something like:
+
+**FunctionDef**
+
+name = checkout
+
+**Call**
+
+function = process_payment
+
+The parser uses this tree to extract meaningful information.
+
+### **Files inside parser/**
+
+| File                    | Responsibility                          |
+| ----------------------- | --------------------------------------- |
+| `ast_parser.py`         | Reads and parses Python files into ASTs |
+| `function_extractor.py` | Finds function and class definitions    |
+| `import_extractor.py`   | Extracts import statements              |
+| `call_extractor.py`     | Identifies function and method calls    |
+
+### **What information should it extract?**
+
+Consider:
+
+```
+from payment import process_paymentclass Order:    def checkout(self):        process_payment()
+```
+
+The parser should extract:
+
+```
+{
+  "module": "orders",
+  "imports": [
+    {
+      "module": "payment",
+      "symbol": "process_payment"
+    }
+  ],
+  "classes": [
+    {
+      "name": "Order",
+      "methods": [
+        "checkout"
+      ]
+    }
+  ],
+  "functions": [
+    {
+      "name": "Order.checkout",
+      "calls": [
+        "process_payment"
+      ]
+    }
+  ]
+}
+```
+
+This is a simplified representation. Actual implementation should also retain source locations, scopes, import aliases and enclosing classes.
+
+### **Important design decision**
+
+The parser should not decide whether a function is vulnerable or reachable.
+
+Its only job is to extract facts about the source code.
+
+For example:
+
+- `checkout()` calls `process_payment()`.
+- `Order` defines a method called `checkout()`.
+- `payment` is imported.
+
+It doesn't know whether `process_payment()` contains a vulnerability.
+
+That responsibility belongs to other modules.
+
+**Output:** Structured source-code information that can be consumed by the symbol resolver and graph builder.
+
+# **4.&#x20;**`symbol_resolver/`**: Resolving function identities**
+
+This module solves a problem that the parser alone cannot solve.
+
+Consider:
+
+```
+from payment import process_paymentdef checkout():    process_payment()
+```
+
+The parser identifies a call named `process_payment`.
+
+But how do we know which actual function this refers to?
+
+The symbol resolver connects that name to its definition.
+
+For example:
+
+```
+process_payment
+       |
+       v
+payment.py
+       |
+       v
+payment.process_payment()
+```
+
+This becomes particularly important when different modules contain functions with identical names.
+
+Consider:
+
+```
+# payment.pydef process():    ...
+```
+
+```
+# notification.pydef process():    ...
+```
+
+The names are identical, but the functions are different.
+
+Therefore, TracerPyX should represent functions using fully qualified names:
+
+```
+payment.process
+notification.process
+```
+
+### **Files inside symbol_resolver/**
+
+**1.&#x20;**`import_resolver.py`
+
+Resolves imports.
+
+```
+from payment import process_payment
+```
+
+Maps `process_payment` to its definition in `payment.py`.
+
+**2.&#x20;**`symbol_table.py`
+
+Maintains information about defined symbols.
+
+For example:
+
+```
+symbol_table = {    "payment.process_payment": {        "file": "payment.py",        "line": 10,        "type": "function"    }}
+```
+
+**3.&#x20;**`attribute_resolver.py`
+
+Resolves attribute-based calls.
+
+```
+payment.process_payment()
+```
+
+**4.&#x20;**`dynamic_dispatch.py`
+
+Attempts to resolve method calls involving objects and inheritance.
+
+For example:
+
+```
+processor.execute()
+```
+
+The resolver attempts to identify the possible classes to which `processor` belongs.
+
+### **Why is this module difficult?**
+
+Python is dynamically typed.
+
+Consider:
+
+```
+def execute(operation):    operation.run()
+```
+
+The actual implementation of `run()` depends on the object passed at runtime.
+
+Static analysis might not be able to determine that object.
+
+Instead of guessing, TracerPyX should record an unresolved call.
+
+This uncertainty must eventually be considered by the engine.
+
+**Output:** Resolved function identities and unresolved-call information.
+
+# **5.&#x20;**`graph/`**: Building dependency and call graphs**
+
+This module converts extracted information into graph structures.
+
+I would actually maintain two different graphs.
+
+## **A. Dependency graph**
+
+This graph describes relationships between packages.
+
+Example:
+
+**My Application**
+
+**Flask**
+
+**Werkzeug**
+
+**Requests**
+
+**urllib3**
+
+This helps identify which packages are included in the project and which dependencies are introduced indirectly.
+
+## **B. Call graph**
+
+This graph describes relationships between functions.
+
+Consider:
+
+```
+# main.pydef main():    checkout()def checkout():    process_payment()
+```
+
+```
+# payment.pydef process_payment():    validate_card()
+```
+
+The graph becomes:
+
+**main.main()**\
+
+
+**main.checkout()**\
+
+
+**payment.process_payment()**\
+
+
+**payment.validate_card()**\
+
+
+Potential vulnerable target
+
+
+
+### **Files inside graph/**
+
+| File                  | Responsibility                           |
+| --------------------- | ---------------------------------------- |
+| `dependency_graph.py` | Builds package-level relationships       |
+| `call_graph.py`       | Stores function-level call relationships |
+| `graph_builder.py`    | Combines parser and resolver results     |
+| `traversal.py`        | Implements DFS/BFS and path finding      |
+
+### **How should the graph be represented?**
+
+For an MVP, an adjacency list is enough:
+
+```
+call_graph = {    "main.main": ["main.checkout"],    "main.checkout": ["payment.process_payment"],    "payment.process_payment": ["payment.validate_card"],    "payment.validate_card": []}
+```
+
+You can use NetworkX to help with graph operations.
+
+However, don't treat every graph edge as equally reliable.
+
+I'd attach metadata to edges:
+
+```
+{    "source": "main.checkout",    "target": "payment.process_payment",    "resolution": "direct_import",    "confidence": "high",    "location": {        "file": "main.py",        "line": 8    }}
+```
+
+This will help the engine distinguish confirmed calls from possible calls.
+
+**Output:** Dependency graph and call graph.
+
+# **6.&#x20;**`scanning_matcher/`**: Finding vulnerable symbols**
+
+This is the second major branch of the architecture.
+
+Until now, we've been examining the application's source code.
+
+Now we need to understand vulnerability advisories.
+
+Imagine the OSV database reports:
+
+```
+Advisory: PYSEC-2026-XXXX
+
+Package: example-library
+
+Affected versions:
+1.0.0 - 1.5.0
+
+Fixed version:
+1.6.0
+
+Description:
+An input validation vulnerability exists
+in the request processing functionality.
+```
+
+The problem is that the advisory might not identify the exact vulnerable function.
+
+Your project needs to discover it.
+
+### **Step 1: Advisory ingestion**
+
+`advisory_loader.py` retrieves advisory information from sources such as:
+
+- PyPA Advisory Database.
+- OSV database.
+- Other supported vulnerability feeds.
+
+Normalize the data into a common format.
+
+### **Step 2: Version matching**
+
+`version_matcher.py` checks whether the installed package version falls inside the affected range.
+
+For example:
+
+```
+Installed version: 1.2.0
+
+Affected range: >=1.0.0, <1.6.0
+
+Result: AFFECTED
+```
+
+Use the `packaging` library to handle Python version comparisons correctly.
+
+### **Step 3: Fix commit identification**
+
+`fix_commit_analyzer.py` searches advisory references, release notes, upstream pull requests and Git history to locate the commit that fixed the vulnerability.
+
+Suppose it finds:
+
+```
+Commit: abc123
+
+Modified:
+example_library/request.py
+```
+
+### **Step 4: Vulnerable symbol extraction**
+
+The tool analyzes the diff and determines which functions were modified.
+
+For example:
+
+```
+def validate_request(data):    # Previous implementation    ...
+```
+
+It extracts:
+
+```
+example_library.request.validate_request
+```
+
+But this is initially a candidate, not necessarily a proven vulnerable function.
+
+The matcher should consider:
+
+- Advisory descriptions.
+- Commit messages.
+- Changed executable code.
+- Pull request descriptions.
+- Release notes.
+- Manually verified symbol mappings.
+
+### **Step 5: Produce a vulnerability record**
+
+The output might look like:
+
+```
+{
+  "id": "PYSEC-2026-XXXX",
+  "package": "example-library",
+  "installed_version": "1.2.0",
+  "affected_symbols": [
+    {
+      "name": "example_library.request.validate_request",
+      "confidence": "medium",
+      "evidence": "fix_commit_analysis"
+    }
+  ]
+}
+```
+
+### **A very important architectural decision**
+
+The advisory matcher must support three situations:
+
+1. Vulnerable functions are explicitly identified by the advisory.
+2. Vulnerable functions are inferred from fix commits.
+3. Vulnerable functions cannot be identified reliably.
+
+The third case should not stop the entire scan. It should produce an uncertain result for that advisory.
+
+**Output:** A normalized list of vulnerabilities and their candidate affected symbols.
+
+# **7.&#x20;**`metadata_cache/`**: Avoiding repeated analysis**
+
+This module stores information that would otherwise have to be repeatedly downloaded or computed.
+
+Imagine running TracerPyX five times on the same project.
+
+You don't want to:
+
+- Download the same advisory five times.
+- Parse unchanged source files five times.
+- Analyze the same fix commit five times.
+- Rebuild identical dependency information five times.
+
+### **Suggested cache structure**
+
+I'd start with SQLite.
+
+```
+metadata_cache/
+│
+├── package_cache.py
+├── advisory_cache.py
+└── commit_cache.py
+```
+
+Potential database tables:
+
+| Table         | Stores                                    |
+| ------------- | ----------------------------------------- |
+| `packages`    | Package names and versions                |
+| `advisories`  | Advisory descriptions and affected ranges |
+| `symbols`     | Candidate vulnerable symbols              |
+| `commits`     | Fix commit information                    |
+| `ast_cache`   | Parsed source metadata                    |
+| `graph_cache` | Previously generated graphs               |
+
+For AST caching, use file content hashes rather than just filenames.
+
+For example:
+
+```
+import hashlibdef calculate_hash(content):    return hashlib.sha256(content).hexdigest()
+```
+
+If the file hasn't changed, its parsed representation can be reused.
+
+The same principle applies to dependency graphs and fix commit analysis.
+
+# **8.&#x20;**`engine/`**: The central decision-making system**
+
+Most important integration component
+
+This is where all the previous modules come together.
+
+The engine should not be responsible for downloading advisories or parsing Python source itself.
+
+Instead, it orchestrates those components.
+
+I would divide it into five files.
+
+| File                | Responsibility                                           |
+| ------------------- | -------------------------------------------------------- |
+| `project_loader.py` | Initializes the project and gathers analysis inputs      |
+| `analyzer.py`       | Coordinates the complete analysis workflow               |
+| `reachability.py`   | Checks paths between entry points and vulnerable symbols |
+| `confidence.py`     | Evaluates evidence quality and unresolved analysis       |
+| `models.py`         | Defines shared data structures                           |
+
+## **A. What exactly happens inside the engine?**
+
+Suppose the project has:
+
+```
+# main.pyfrom services import checkoutdef main():    checkout()
+```
+
+```
+# services.pyfrom example_library import validate_requestdef checkout():    validate_request()
+```
+
+The advisory matcher identifies:
+
+```
+example_library.validate_request
+```
+
+as a vulnerable function.
+
+The graph builder creates:
+
+```
+main.main
+    |
+    v
+services.checkout
+    |
+    v
+example_library.validate_request
+```
+
+Now the engine performs reachability analysis.
+
+### **B. Reachability algorithm**
+
+For each advisory:
+
+1. Obtain its affected symbols.
+2. Find those symbols in the call graph.
+3. Obtain the application's entry points.
+4. Search for paths from the entry points to the vulnerable symbols.
+5. Examine unresolved calls and incomplete analysis.
+6. Produce the classification and evidence.
+
+A simplified algorithm:
+
+```
+def analyze_vulnerability(    graph,    entry_points,    vulnerable_symbols):    paths = []    for entry in entry_points:        for target in vulnerable_symbols:            path = find_path(                graph,                entry,                target            )            if path:                paths.append(path)    if paths:        return {            "status": "reachable",            "paths": paths        }    if graph.has_unresolved_relevant_calls:        return {            "status": "uncertain",            "reason": "Unresolved calls"        }    return {        "status": "not_reachable"    }
+```
+
+This is pseudocode, not production-ready implementation.
+
+In particular, `graph.has_unresolved_relevant_calls` cannot simply be a global boolean. The engine needs to establish whether unresolved calls could connect an entry point to the affected package or symbol.
+
+Also, if the advisory's affected function is unknown, the engine must not treat the absence of a matching graph node as proof of non-reachability.
+
+## **C. Confidence evaluation**
+
+I strongly recommend keeping confidence evaluation separate from reachability traversal.
+
+For example:
+
+| Evidence                                            | Confidence                            |
+| --------------------------------------------------- | ------------------------------------- |
+| Direct import and direct call resolved              | High                                  |
+| Call resolved through inheritance                   | Medium or high, depending on evidence |
+| Possible dynamic dispatch targets                   | Medium                                |
+| Unresolved reflection                               | Uncertain                             |
+| Vulnerable symbol inferred from an ambiguous commit | Uncertain                             |
+
+Don't just calculate an arbitrary numerical confidence score and use a threshold to declare software safe.
+
+The engine should track *why* it trusts or doesn't trust its conclusions.
+
+# **9. How should the three classifications work?**
+
+This is probably the most important design decision in the entire project.
+
+**Reachable**
+
+Risk identified
+
+The analysis establishes a call path to the vulnerable function.
+
+Example:
+
+```
+main()
+  -> checkout()
+    -> validate_request()
+```
+
+The tool reports the path as evidence.
+
+**Not reachable**
+
+No path established
+
+The analysis has sufficient coverage to establish that the vulnerable code cannot be reached from the analyzed entry points.
+
+This requires careful handling of dynamic dispatch, imports, callbacks and other execution mechanisms.
+
+**Uncertain**
+
+Insufficient evidence
+
+The analysis cannot confidently establish either conclusion.
+
+Examples:
+
+- Dynamic imports.
+- Reflection.
+- Unknown method targets.
+- Missing package source.
+- Ambiguous vulnerable-function identification.
+
+There is another subtle point: static reachability does not prove that an attacker can exploit a vulnerability. It establishes that the vulnerable code may be executed through an application path.
+
+Actual exploitability can depend on user input, runtime conditions, permissions and other factors.
+
+# **10.&#x20;**`reporter/`**: Communicating the results**
+
+Once the engine has analyzed all advisories, the reporter converts the results into usable outputs.
+
+I'd provide three initial reporters.
+
+### **A. Terminal reporter**
+
+For developers running the tool locally.
+
+```
+TracerPyX Security Scan
+
+Project: my-project
+
+Total advisories: 10
+
+Reachable:       3
+Not reachable:   4
+Uncertain:       3
+
+--------------------------------
+
+CVE-2026-XXXX
+
+Status: REACHABLE
+
+Vulnerable function:
+example_library.validate_request
+
+Call path:
+main.main
+ -> services.checkout
+ -> example_library.validate_request
+
+--------------------------------
+
+CVE-2026-YYYY
+
+Status: NOT REACHABLE
+
+Reason:
+No supported path from analyzed entry points
+to the affected function was found.
+```
+
+### **B. JSON reporter**
+
+For other software to consume the output.
+
+Example:
+
+```
+{
+  "project": "my-project",
+  "summary": {
+    "total": 10,
+    "reachable": 3,
+    "not_reachable": 4,
+    "uncertain": 3
+  },
+  "results": []
+}
+```
+
+### **C. OpenVEX reporter**
+
+This is how TracerPyX communicates that a vulnerability does not affect a particular product.
+
+For example:
+
+```
+Vulnerability: CVE-2026-YYYY
+Product: my-project
+Status: not_affected
+Justification: vulnerable_code_not_in_execute_path
+```
+
+Only sufficiently established non-reachability results should generate `not_affected` statements.
+
+For reachable vulnerabilities, report them without claiming that static reachability proves exploitability. For uncertain vulnerabilities, do not issue a not-affected statement.
+
+# **11.&#x20;**`integrations/`**: Connecting with existing development workflows**
+
+This module allows TracerPyX to work with the tools developers already use.
+
+I'd initially support:
+
+| Integration | Purpose                                    |
+| ----------- | ------------------------------------------ |
+| pip         | Read installed dependencies                |
+| Poetry      | Read Poetry lockfiles                      |
+| uv          | Read uv lockfiles                          |
+| CI          | Run scans automatically during development |
+
+For example, a GitHub Actions workflow might execute:
+
+```
+name: TracerPyX Security Scan
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  security:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - run: pip install tracerpyx
+
+      - run: tracerpyx scan .
+```
+
+The CI integration should eventually allow teams to configure what happens when a vulnerability is reachable or uncertain.
+
+For instance, a team might fail a build for confirmed reachable vulnerabilities while reporting uncertain ones for manual review.
+
+# **12. How all modules communicate: A complete example**
+
+Let's put everything together using one example.
+
+Suppose a project has this structure:
+
+```
+my-project/
+│
+├── main.py
+├── user_service.py
+├── payment.py
+└── requirements.txt
+```
+
+`requirements.txt`:
+
+```
+example-library==1.2.0
+```
+
+`main.py`:
+
+```
+from user_service import process_userdef main():    process_user()
+```
+
+`user_service.py`:
+
+```
+from payment import make_paymentdef process_user():    make_payment()
+```
+
+`payment.py`:
+
+```
+from example_library import validate_requestdef make_payment():    validate_request()
+```
+
+Suppose a real advisory identifies `validate_request()` as vulnerable.
+
+Here is how the complete system processes it:
+
+1. **Input layer**
+
+   Discovers the project and identifies `example-library==1.2.0`.
+2. **Parser**
+
+   Extracts all function definitions, imports and calls from the three files.
+3. **Symbol resolver**
+
+   Resolves `process_user`, `make_payment` and `validate_request` to their actual definitions.
+4. **Graph builder**
+
+   Creates the call graph connecting all four functions.
+5. **Advisory matcher**
+
+   Retrieves the advisory, verifies the affected version and identifies `example_library.validate_request` as the affected symbol.
+6. **Analysis engine**
+
+   Searches from `main.main()` to the vulnerable symbol.
+7. **Reporter**
+
+   Produces a reachable classification and the call path.
+
+**Final analysis result**
+
+Reachable
+
+Illustrative example
+
+```
+main.main()
+    |
+    v
+user_service.process_user()
+    |
+    v
+payment.make_payment()
+    |
+    v
+example_library.validate_request()
+```
+
+The vulnerable function is reachable from the application's configured entry point.
+
+# **13. Recommended final folder architecture and responsibilities**
+
+Here is how I'd divide ownership between components.
+
+| Directory           | Takes input from                                        | Produces                                   |
+| ------------------- | ------------------------------------------------------- | ------------------------------------------ |
+| `parser/`           | Python files                                            | AST and extracted code facts               |
+| `symbol_resolver/`  | AST facts                                               | Resolved symbols and unresolved calls      |
+| `graph/`            | Resolved symbols and calls                              | Dependency graph and call graph            |
+| `scanning_matcher/` | Advisory databases, package versions and Git references | Vulnerability records and affected symbols |
+| `metadata_cache/`   | All subsystems                                          | Cached metadata and analysis results       |
+| `engine/`           | Graphs, entry points and vulnerability records          | Reachability classifications and evidence  |
+| `reporter/`         | Engine results                                          | Terminal, JSON and OpenVEX                 |
+| `integrations/`     | External package managers and CI systems                | Project inputs and workflow integration    |
+| `tests/`            | Fixtures and expected results                           | Validation of all components               |
+
+The engine should be the orchestrator, not a place where all the code is written.
+
+I would also add a shared `models.py` or `schemas.py` layer for common objects such as `Project`, `Package`, `FunctionSymbol`, `CallEdge`, `Advisory`, `VulnerabilityTarget` and `AnalysisResult`. This prevents modules from inventing incompatible data formats.
+
+# **14. What should you implement first?**
+
+I would prioritize implementation in this order:
+
+## **Development roadmap**
+
+**Implementation progress**
+
+0/11
+
+**1. Project discovery and dependency extraction**
+
+Read project files and identify installed/resolved package versions.
+
+**2. AST parser**
+
+Extract functions, imports, classes and calls.
+
+**3. Symbol resolver**
+
+Resolve direct imports and function identities.
+
+**4. Basic call graph**
+
+Construct graph nodes and edges.
+
+**5. Manual vulnerability target input**
+
+Provide a known vulnerable function without needing advisory automation yet.
+
+**6. Reachability engine**
+
+Test reachable and not-reachable cases with evidence.
+
+**7. Advisory ingestion**
+
+Connect OSV and PyPA advisory data.
+
+**8. Fix commit analyzer**
+
+Identify candidate affected symbols from Git diffs.
+
+**9. Uncertainty handling**
+
+Handle unresolved calls and incomplete analysis.
+
+**10. JSON and OpenVEX reporting**
+
+Produce machine-readable results.
+
+**11. Package-manager and CI integrations**
+
+Support real developer workflows.
+
+## **My most important recommendation**
+
+Don't begin by integrating OSV, GitHub, PyPA, NetworkX, OpenVEX and every other technology together.
+
+Build a small working demonstration first:
+
+- One Python application.
+- One dependency.
+- One known vulnerability.
+- One identified vulnerable function.
+- One call graph.
+- One reachable and one not-reachable test case.
+
+Once this works, automate advisory ingestion and vulnerable-function discovery.
+
+The hardest technical challenges are likely to be:
+
+1. **Vulnerable function identification:** Advisory descriptions and fix commits don't always reveal the exact vulnerable symbol.
+2. **Python dynamic behavior:** Reflection, monkey patching and dynamic dispatch make complete static call graphs difficult.
+3. **Sound non-reachability decisions:** You must avoid incorrectly declaring a vulnerability irrelevant simply because your analyzer failed to find a call.
+
+These three challenges are where most of the actual engineering effort should go.
+
+**The architecture's central principle:** The parser understands code, the matcher understands vulnerabilities, the graph connects functions, and the engine uses both to determine reachability. Keeping those responsibilities separate will make TracerPyX considerably easier to develop, test and extend.
