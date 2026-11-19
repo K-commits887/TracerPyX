@@ -30,18 +30,45 @@ def _cmd_scan(args: argparse.Namespace) -> int:
 
 def _cmd_advisory(args: argparse.Namespace) -> int:
     """Handler for the 'advisory' subcommand."""
+    from tracerpyx.db import AdvisoryRepository, DatabaseManager, run_migrations
+    from tracerpyx.intelligence import sync_package_advisories
+
     action = getattr(args, "advisory_action", None)
+    db_path = Path(args.db_path).expanduser().resolve()
+    db = DatabaseManager(db_path)
+    run_migrations(db)
+
+    adv_repo = AdvisoryRepository(db)
+
     if action == "lookup":
-        target = args.package or args.id
-        if not target:
+        if args.package:
+            advisories = adv_repo.get_advisories_for_package(args.package)
+            print(f"Found {len(advisories)} advisory(s) for package '{args.package}':")
+            for adv in advisories:
+                alias_str = f" ({', '.join(adv.aliases)})" if adv.aliases else ""
+                print(f" - [{adv.id}]{alias_str} {adv.title}")
+            return 0
+        elif args.id:
+            adv = adv_repo.get_advisory(args.id)
+            if adv:
+                alias_str = f" ({', '.join(adv.aliases)})" if adv.aliases else ""
+                print(f"Advisory: [{adv.id}]{alias_str}")
+                print(f"Title:    {adv.title}")
+                print(f"Source:   {adv.source}")
+                for pkg in adv.affected_packages:
+                    ranges = ", ".join(vr.to_display_string() for vr in pkg.version_ranges)
+                    print(f"Package:  {pkg.package_name} ({ranges})")
+            else:
+                print(f"No advisory found with ID: {args.id}")
+            return 0
+        else:
             logger.error("Must specify either --package or --id for lookup.")
             return 2
-        logger.info("Looking up advisories for: %s", target)
-        print(f"Advisory lookup placeholder for: {target}")
-        return 0
+
     elif action == "sync":
-        logger.info("Syncing advisories for package: %s", args.package)
-        print(f"Advisory sync placeholder for: {args.package}")
+        print(f"Synchronizing advisories from OSV for package '{args.package}'...")
+        advisories = sync_package_advisories(args.package, db)
+        print(f"Successfully synchronized {len(advisories)} advisory(s) for '{args.package}'.")
         return 0
     else:
         logger.error("No valid advisory action specified. Use --help.")
@@ -129,10 +156,19 @@ def build_parser() -> argparse.ArgumentParser:
         description="Available TracerPyX commands",
     )
 
+    # Common parent parser for database path
+    db_parent = argparse.ArgumentParser(add_help=False)
+    db_parent.add_argument(
+        "--db-path",
+        default="~/.tracerpyx/tracerpyx.db",
+        help="Path to SQLite database file.",
+    )
+
     # 1. 'scan' subcommand
     scan_parser = subparsers.add_parser(
         "scan",
         help="Scan a Python project for reachable dependency vulnerabilities.",
+        parents=[db_parent],
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     scan_parser.add_argument(
@@ -146,11 +182,6 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         help="Explicit application entry point in 'module:function' format (can be repeated).",
-    )
-    scan_parser.add_argument(
-        "--db-path",
-        default="~/.tracerpyx/tracerpyx.db",
-        help="Path to SQLite database storing advisories and vulnerable symbols.",
     )
     scan_parser.add_argument(
         "-f", "--format",
@@ -169,6 +200,7 @@ def build_parser() -> argparse.ArgumentParser:
     adv_parser = subparsers.add_parser(
         "advisory",
         help="Query or synchronize vulnerability advisories.",
+        parents=[db_parent],
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     adv_subparsers = adv_parser.add_subparsers(
@@ -176,24 +208,27 @@ def build_parser() -> argparse.ArgumentParser:
         title="actions",
     )
 
-    lookup_parser = adv_subparsers.add_parser("lookup", help="Search for advisories in the local database.")
+    lookup_parser = adv_subparsers.add_parser(
+        "lookup",
+        parents=[db_parent],
+        help="Search for advisories in the local database.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     lookup_group = lookup_parser.add_mutually_exclusive_group(required=True)
     lookup_group.add_argument("-p", "--package", help="Package name to lookup.")
     lookup_group.add_argument("-i", "--id", help="Advisory ID (e.g. GHSA-xxx, PYSEC-xxx, CVE-xxx).")
 
-    sync_parser = adv_subparsers.add_parser("sync", help="Sync advisories from OSV for a package.")
+    sync_parser = adv_subparsers.add_parser(
+        "sync",
+        parents=[db_parent],
+        help="Sync advisories from OSV for a package.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     sync_parser.add_argument("-p", "--package", required=True, help="Package name to synchronize.")
 
     adv_parser.set_defaults(handler=_cmd_advisory)
 
     # 3. 'db' subcommand
-    db_parent = argparse.ArgumentParser(add_help=False)
-    db_parent.add_argument(
-        "--db-path",
-        default="~/.tracerpyx/tracerpyx.db",
-        help="Path to SQLite database file.",
-    )
-
     db_parser = subparsers.add_parser(
         "db",
         help="Manage the local TracerPyX SQLite database.",

@@ -53,28 +53,63 @@ def test_scan_command_missing_project(tmp_path: Path) -> None:
     assert ret == 2
 
 
-def test_advisory_lookup_by_package(capsys: pytest.CaptureFixture[str]) -> None:
+def test_advisory_lookup_by_package(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     """Ensure advisory lookup by package runs successfully."""
-    ret = main(["advisory", "lookup", "-p", "requests"])
+    from tracerpyx.core.models import Advisory, AffectedPackage
+    from tracerpyx.db import AdvisoryRepository, DatabaseManager, run_migrations
+
+    db_path = str(tmp_path / "adv_test.db")
+    db = DatabaseManager(db_path)
+    run_migrations(db)
+    adv_repo = AdvisoryRepository(db)
+    pkg = AffectedPackage(package_name="requests")
+    adv = Advisory(id="GHSA-test-1", source="OSV", title="Test flaw", affected_packages=(pkg,))
+    adv_repo.save_advisory(adv)
+    db.close()
+
+    ret = main(["advisory", "lookup", "-p", "requests", "--db-path", db_path])
     assert ret == 0
     captured = capsys.readouterr()
-    assert "Advisory lookup placeholder for: requests" in captured.out
+    assert "Found 1 advisory(s) for package 'requests'" in captured.out
+    assert "GHSA-test-1" in captured.out
 
 
-def test_advisory_lookup_by_id(capsys: pytest.CaptureFixture[str]) -> None:
+def test_advisory_lookup_by_id(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     """Ensure advisory lookup by advisory ID runs successfully."""
-    ret = main(["advisory", "lookup", "-i", "GHSA-j8r2-6x86-q33q"])
+    from tracerpyx.core.models import Advisory
+    from tracerpyx.db import AdvisoryRepository, DatabaseManager, run_migrations
+
+    db_path = str(tmp_path / "adv_test.db")
+    db = DatabaseManager(db_path)
+    run_migrations(db)
+    adv_repo = AdvisoryRepository(db)
+    adv = Advisory(id="GHSA-j8r2-6x86-q33q", source="GHSA", title="Requests Header Leak")
+    adv_repo.save_advisory(adv)
+    db.close()
+
+    ret = main(["advisory", "lookup", "-i", "GHSA-j8r2-6x86-q33q", "--db-path", db_path])
     assert ret == 0
     captured = capsys.readouterr()
-    assert "Advisory lookup placeholder for: GHSA-j8r2-6x86-q33q" in captured.out
+    assert "Advisory: [GHSA-j8r2-6x86-q33q]" in captured.out
+    assert "Requests Header Leak" in captured.out
 
 
-def test_advisory_sync(capsys: pytest.CaptureFixture[str]) -> None:
-    """Ensure advisory sync runs successfully."""
-    ret = main(["advisory", "sync", "-p", "flask"])
+def test_advisory_sync(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """Ensure advisory sync runs successfully when mocked."""
+    import tracerpyx.cli
+    from tracerpyx.core.models import Advisory
+
+    db_path = str(tmp_path / "sync_test.db")
+
+    def mock_sync(package_name: str, db: object) -> list[Advisory]:
+        return [Advisory(id="GHSA-mock-1", source="OSV", title="Mock Vulnerability")]
+
+    monkeypatch.setattr("tracerpyx.intelligence.sync_package_advisories", mock_sync)
+
+    ret = main(["advisory", "sync", "-p", "flask", "--db-path", db_path])
     assert ret == 0
     captured = capsys.readouterr()
-    assert "Advisory sync placeholder for: flask" in captured.out
+    assert "Successfully synchronized 1 advisory(s) for 'flask'" in captured.out
 
 
 def test_db_subcommands(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

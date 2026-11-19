@@ -1,0 +1,80 @@
+{
+  "vulns": [
+    {
+      "schema_version": "1.6.0",
+      "id": "GHSA-j8r2-6x86-q33q",
+      "modified": "2023-05-24T18:47:04Z",
+      "published": "2023-05-23T18:18:24Z",
+      "aliases": [
+        "CVE-2023-32681"
+      ],
+      "summary": "Requests Proxy-Authorization Header Information Disclosure",
+      "details": "In Requests (< 2.31.0), Proxy-Authorization headers are leaked on HTTPS cross-origin redirects.",
+      "affected": [
+        {
+          "package": {
+            "ecosystem": "PyPI",
+            "name": "requests"
+          },
+          "ranges": [
+            {
+              "type": "ECOSYSTEM",
+              "events": [
+                {
+                  "introduced": "2.3.0"
+                },
+                {
+                  "fixed": "2.31.0"
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "references": [
+        {
+          "type": "FIX",
+          "url": "https://github.com/psf/requests/commit/7492dc4879e37fc361099b2447990db207567702"
+        }
+      ]
+    },
+    {
+      "schema_version": "1.6.0",
+      "id": "PYSEC-2018-28",
+      "modified": "2021-06-10T08:14:40Z",
+      "published": "2018-09-19T15:29:00Z",
+      "aliases": [
+        "CVE-2018-18074"
+      ],
+      "summary": "Redirect credentials leak in requests",
+      "details": "Requests 2.19.1 and earlier allows redirect credentials leak.",
+      "affected": [
+        {
+          "package": {
+            "ecosystem": "PyPI",
+            "name": "requests"
+          },
+          "ranges": [
+            {
+              "type": "ECOSYSTEM",
+              "events": [
+                {
+                  "introduced": "0"
+                },
+                {
+                  "fixed": "2.20.0"
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "references": [
+        {
+          "type": "FIX",
+          "url": "https://github.com/psf/requests/commit/c8f2963c6218"
+        }
+      ]
+    }
+  ]
+}
